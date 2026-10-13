@@ -9,6 +9,7 @@
 
 #include <array>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -58,6 +59,14 @@ public:
 	 * @param domain_arg: Domain object from net transport
 	 */
 	nccl_ofi_rdma_gin_ep_t(nccl_net_ofi_domain_t &domain_arg);
+
+	/**
+	 * Handler for remote-write CQ entries that carry no op_context. Endpoint-MR
+	 * providers (CXI) deliver write-with-immediate data without consuming a
+	 * posted receive, so there is no rx request to dispatch through. Set by
+	 * nccl_ofi_gin_resources; only used when endpoint_mr is true.
+	 */
+	std::function<int(struct fi_cq_data_entry *, fi_addr_t, uint16_t)> remote_write_cb;
 
 	nccl_ofi_rdma_gin_ep_t(const nccl_ofi_rdma_gin_ep_t &) = delete;
 	nccl_ofi_rdma_gin_ep_t &operator=(const nccl_ofi_rdma_gin_ep_t &) = delete;

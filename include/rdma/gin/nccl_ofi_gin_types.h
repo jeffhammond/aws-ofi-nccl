@@ -112,10 +112,15 @@ static_assert(GIN_ACK_INTERVAL <= (GIN_IMM_SEQ_MASK >> 1),
 /* Maximum number of GIN comms */
 #define NCCL_GIN_MAX_COMMS    (1 << GIN_IMM_COMM_BITS)
 
+/* Sender rank carried in control messages. Only populated for providers whose
+ * receive completions carry no usable source address (endpoint-MR providers
+ * such as CXI); zero otherwise. */
+#define GIN_MSG_SRC_RANK_BITS 20
+
 /* Reserved bit computation for Metadata message header */
 #define GIN_MSG_HEADER_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS \
                                       - GIN_IMM_SEQ_BITS - GIN_IMM_SEG_CNT_BITS \
-                                      - 1 /* ack_req */)
+                                      - 1 /* ack_req */ - GIN_MSG_SRC_RANK_BITS)
 
 /**
  * Metadata message header (64 bits).
@@ -138,6 +143,8 @@ struct nccl_net_ofi_gin_msg_header_t {
 	 * sets both to the same value, the receiver OR's them across the two
 	 * submission paths. */
 	uint64_t ack_req         : 1;
+	/* Sender rank (see GIN_MSG_SRC_RANK_BITS) */
+	uint64_t src_rank        : GIN_MSG_SRC_RANK_BITS;
 	/* Reserved for future use */
 	uint64_t reserved        : GIN_MSG_HEADER_RESERVED_BITS;
 };
@@ -159,7 +166,7 @@ static_assert(sizeof(nccl_net_ofi_gin_signal_metadata_msg_t) == 32,
 	     "nccl_net_ofi_gin_signal_metadata_msg_t must be exactly 32 bytes for inline send");
 
 #define GIN_ACK_MSG_RESERVED_BITS (64 - GIN_MSG_TYPE_BITS - GIN_IMM_COMM_BITS \
-                                   - GIN_RX_CONSUMED_BITS)
+                                   - GIN_RX_CONSUMED_BITS - GIN_MSG_SRC_RANK_BITS)
 
 /**
  * Standalone ACK message sent via fi_send from receiver to sender (8 bytes).
@@ -174,6 +181,8 @@ struct gin_ack_msg_t {
 	uint64_t ack_comm_id     : GIN_IMM_COMM_BITS;
 	/* Receiver's rx_consumed cursor (wraps at 2x seq window) */
 	uint64_t rx_consumed     : GIN_RX_CONSUMED_BITS;
+	/* Sender rank (see GIN_MSG_SRC_RANK_BITS) */
+	uint64_t src_rank        : GIN_MSG_SRC_RANK_BITS;
 	/* Reserved for future use */
 	uint64_t reserved        : GIN_ACK_MSG_RESERVED_BITS;
 };
@@ -193,12 +202,12 @@ static_assert(offsetof(nccl_net_ofi_gin_signal_metadata_msg_t, header) == 0,
 #if !defined(__clang__) && defined(__GNUC__) && (__GNUC__ >= 9)
 static_assert(
 	__builtin_bit_cast(uint64_t,
-		nccl_net_ofi_gin_msg_header_t{GIN_MSG_TYPE_MAX, 0, 0, 0, 0, 0})
+		nccl_net_ofi_gin_msg_header_t{GIN_MSG_TYPE_MAX, 0, 0, 0, 0, 0, 0})
 		== (uint64_t)GIN_MSG_TYPE_MAX,
 	"msg_type must be at LSB of nccl_net_ofi_gin_msg_header_t");
 static_assert(
 	__builtin_bit_cast(uint64_t,
-		gin_ack_msg_t{GIN_MSG_TYPE_MAX, 0, 0, 0})
+		gin_ack_msg_t{GIN_MSG_TYPE_MAX, 0, 0, 0, 0})
 		== (uint64_t)GIN_MSG_TYPE_MAX,
 	"msg_type must be at LSB of gin_ack_msg_t");
 #endif

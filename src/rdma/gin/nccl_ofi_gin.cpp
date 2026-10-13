@@ -282,6 +282,9 @@ int nccl_ofi_rdma_gin_put_comm::send_ack(nccl_ofi_rdma_gin_put_comm &gin_comm, u
 	ack_msg->msg_type = GIN_MSG_TYPE_ACK;
 	ack_msg->ack_comm_id = static_cast<uint16_t>(peer_comm_id);
 	ack_msg->rx_consumed = rx_consumed & GIN_RX_CONSUMED_MASK;
+	if (endpoint_mr) {
+		ack_msg->src_rank = static_cast<uint64_t>(gin_comm.get_rank());
+	}
 
 	auto *ofi_ep = ep.get_rail(rail_id).ofi_ep.get();
 
@@ -748,6 +751,12 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		nseg += num_xfers;
 		assert_always(nseg > 0);
 		uint64_t data = GIN_IMM_SEG_DATA(remote_comm_id, msg_seq_num, nseg, is_ack_requested);
+		if (endpoint_mr) {
+			/* Remote CQ data on endpoint-MR providers (CXI) carries no source
+			   address; the sender rank rides in the upper 32 bits of the
+			   64-bit CQ data. */
+			data |= static_cast<uint64_t>(this->rank) << 32;
+		}
 
 		/* The metadata send (if any) colocates with the first stripe's rail. */
 		rail_id = xfers[0].rail_id;
@@ -830,6 +839,9 @@ int nccl_ofi_rdma_gin_put_comm::iputSignal(uint64_t srcOff, nccl_ofi_gin_symm_mr
 		metadata_send->header.seq_num = msg_seq_num;
 		metadata_send->header.seq_seg_cnt = nseg;
 		metadata_send->header.ack_req = is_ack_requested ? 1 : 0;
+		if (endpoint_mr) {
+			metadata_send->header.src_rank = static_cast<uint64_t>(this->rank);
+		}
 		metadata_send->signal_base_address =
 			(sig_mr ? sig_mr->remote_mr[dst_rank].address : 0);
 		metadata_send->signal_offset = signalOff;
@@ -1816,7 +1828,8 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 	uint16_t msg_seq_num = metadata_msg->header.seq_num;
 	uint16_t num_segments = metadata_msg->header.seq_seg_cnt;
 
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	uint32_t peer_rank = endpoint_mr ? static_cast<uint32_t>(metadata_msg->header.src_rank)
+					 : get_peer_rank(src_addr, rank_map[rail_id]);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_SIGNAL_METADATA_COMPLETION_FUNC_START(
 		dev, this, rail_id, peer_rank, msg_seq_num, num_segments);
@@ -1861,7 +1874,8 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_metadata_completion(
 int nccl_ofi_rdma_gin_put_comm::handle_ack_completion(const gin_ack_msg_t *ack_msg,
 						      fi_addr_t src_addr, uint16_t rail_id)
 {
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	uint32_t peer_rank = endpoint_mr ? static_cast<uint32_t>(ack_msg->src_rank)
+					 : get_peer_rank(src_addr, rank_map[rail_id]);
 	uint32_t rx_consumed = ack_msg->rx_consumed;
 
 	NCCL_OFI_TRACE_GIN_HANDLE_ACK_COMPLETION_FUNC_START(dev, this, rail_id, peer_rank, rx_consumed);
@@ -1895,7 +1909,8 @@ int nccl_ofi_rdma_gin_put_comm::handle_signal_write_completion(struct fi_cq_data
 	uint16_t msg_seq_num = GIN_IMM_GET_SEQ_NUM(cq_entry->data);
 	bool is_ack_requested = GIN_IMM_GET_ACK_REQUESTED(cq_entry->data);
 
-	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
+	uint32_t peer_rank = endpoint_mr ? static_cast<uint32_t>(cq_entry->data >> 32)
+					 : get_peer_rank(src_addr, rank_map[rail_id]);
 
 	NCCL_OFI_TRACE_GIN_HANDLE_SIGNAL_WRITE_COMPLETION_FUNC_START(dev, this, rail_id, peer_rank,
 								     msg_seq_num, total_segms,

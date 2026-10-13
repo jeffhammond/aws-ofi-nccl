@@ -19,6 +19,7 @@
 #include "nccl_ofi_param.h"
 #include "nccl_ofi.h"
 #include "nccl_ofi_log.h"
+#include "rdma/gin/nccl_ofi_gin.h"
 
 std::shared_ptr<nccl_ofi_gin_resources>
 nccl_ofi_gin_resources_registry::get(const std::shared_ptr<nccl_net_ofi_ep_t> &ep)
@@ -78,6 +79,16 @@ int nccl_ofi_rdma_gin_ep_t::gin_process_completions(struct fi_cq_data_entry *cq_
 
 	for (uint64_t comp_idx = 0; comp_idx < num_cqes; comp_idx++) {
 		void *op_ctx = cq_entry[comp_idx].op_context;
+
+		if (op_ctx == NULL && endpoint_mr && remote_write_cb &&
+		    (cq_entry[comp_idx].flags & FI_REMOTE_WRITE)) {
+			ret = remote_write_cb(&cq_entry[comp_idx], src_addrs[comp_idx], rail_id);
+			if (OFI_UNLIKELY(ret != 0)) {
+				NCCL_OFI_WARN("Remote write completion failed: %d", ret);
+				return ret;
+			}
+			continue;
+		}
 
 		if (OFI_UNLIKELY(op_ctx == NULL)) {
 			NCCL_OFI_WARN("Invalid request context provided");
@@ -245,12 +256,6 @@ int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 {
 	int ret = 0;
 
-	/* We do not support endpoint_mr mode yet */
-	if (OFI_UNLIKELY(endpoint_mr)) {
-		NCCL_OFI_WARN("Endpoint MR mode is not supported yet.");
-		return -EINVAL;
-	}
-
 	*mhandle = NULL;
 
 	nccl_ofi_idpool_t *key_pool = this->domain.mr_rkey_pool;
@@ -284,6 +289,22 @@ int nccl_ofi_rdma_gin_ep_t::reg_mr(nccl_ofi_mr_ckey_ref ckey, int type,
 			NCCL_OFI_WARN("Could not register memory on rail %u with flag %lu", rail_id,
 				      regattr_flags);
 			return mr_result.error_code;
+		}
+		if (endpoint_mr) {
+			/* FI_MR_ENDPOINT: bind the MR to this rail's endpoint and enable it */
+			struct fid_ep *rail_ep = this->get_rail(rail_id).ofi_ep.get();
+			ret = fi_mr_bind(mr_result.resource.get(), &rail_ep->fid, 0);
+			if (OFI_UNLIKELY(ret != 0)) {
+				NCCL_OFI_WARN("fi_mr_bind (GIN rail %u) failed: rc=%d, error=%s",
+					      rail_id, ret, fi_strerror(-ret));
+				return ret;
+			}
+			ret = fi_mr_enable(mr_result.resource.get());
+			if (OFI_UNLIKELY(ret != 0)) {
+				NCCL_OFI_WARN("fi_mr_enable (GIN rail %u) failed: rc=%d, error=%s",
+					      rail_id, ret, fi_strerror(-ret));
+				return ret;
+			}
 		}
 		ret_handle->set_mr(rail_id, mr_result.resource);
 	}
@@ -323,6 +344,16 @@ int nccl_ofi_rdma_gin_ep_t::freelist_deregmr_fn(void *handle)
 /**
  * Much of this taken from the same function in RDMA transport
  */
+/**
+ * EFA reports FI_RX_CQ_DATA as the way to avoid consuming receive buffers for
+ * write-with-immediate. Endpoint-MR providers (CXI) deliver remote CQ data
+ * without consuming a receive and do not advertise the mode bit.
+ */
+static inline bool gin_provider_needs_rx_cq_data(const struct fi_info *ref_info)
+{
+	return !(ref_info->domain_attr->mr_mode & FI_MR_ENDPOINT);
+}
+
 static inline void get_gin_hints(struct fi_info &hints, struct fi_info *ref_info)
 {
 	hints.caps = 0;
@@ -334,13 +365,22 @@ static inline void get_gin_hints(struct fi_info &hints, struct fi_info *ref_info
 	hints.caps |= FI_LOCAL_COMM | FI_REMOTE_COMM | FI_SOURCE;
 
 	/* Mode. GIN sets `FI_RX_CQ_DATA` as an indirect way to disable unsolicited write */
-	hints.mode = FI_CONTEXT | FI_CONTEXT2 | FI_RX_CQ_DATA;
+	hints.mode = FI_CONTEXT | FI_CONTEXT2 | (gin_provider_needs_rx_cq_data(ref_info) ? FI_RX_CQ_DATA : 0);
 
 	hints.ep_attr->type = FI_EP_RDM;
 
-	hints.domain_attr->mr_mode =
-		FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-	hints.domain_attr->mr_key_size = (size_t)ofi_nccl_mr_key_size();
+	if (ref_info->domain_attr->mr_mode & FI_MR_ENDPOINT) {
+		/* Endpoint-MR providers (CXI): mirror the mode the NET transport
+		   negotiated; keys are provider-generated and as wide as the
+		   provider says. */
+		hints.domain_attr->mr_mode = FI_MR_HMEM | FI_MR_ALLOCATED | FI_MR_PROV_KEY |
+					     FI_MR_ENDPOINT;
+		hints.domain_attr->mr_key_size = ref_info->domain_attr->mr_key_size;
+	} else {
+		hints.domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR |
+					     FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+		hints.domain_attr->mr_key_size = (size_t)ofi_nccl_mr_key_size();
+	}
 	hints.domain_attr->threading = FI_THREAD_COMPLETION;
 
 	hints.domain_attr->control_progress =
@@ -394,7 +434,7 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 		throw std::runtime_error("No providers available for GIN");
 	} else if (results->next != nullptr) {
 		throw std::runtime_error("Unexpectedly got more than one GIN provider");
-	} else if (!(results->mode & FI_RX_CQ_DATA)) {
+	} else if (gin_provider_needs_rx_cq_data(info) && !(results->mode & FI_RX_CQ_DATA)) {
 		throw std::runtime_error("Provider does not support FI_RX_CQ_DATA");
 	} else if (results->domain_attr->cq_data_size < 4) {
 		throw std::runtime_error("Provider does not support cq_data_size of 4");
@@ -518,6 +558,14 @@ nccl_ofi_gin_resources::nccl_ofi_gin_resources(const std::shared_ptr<nccl_net_of
 	this->req_fl.reset(req_fl_tmp);
 
 	init_flush_buffers(num_rails);
+
+	if (endpoint_mr) {
+		gin_ep.remote_write_cb = [this](struct fi_cq_data_entry *e, fi_addr_t src,
+						uint16_t rail) NO_THREAD_SAFETY_ANALYSIS {
+			auto &gin_comm = get_comm(GIN_IMM_GET_COMM_ID(e->data));
+			return gin_comm.handle_signal_write_completion(e, src, rail);
+		};
+	}
 }
 
 void nccl_ofi_gin_resources::init_flush_buffers(uint16_t num_rails)

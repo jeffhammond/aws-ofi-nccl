@@ -255,7 +255,16 @@ int nccl_net_ofi_gin_write_req_t::post()
 	msg.context = &ctx.ofi_ctx;
 	msg.data = imm_data;
 
-	ssize_t rc = fi_writemsg(ep, &msg, flags);
+	ssize_t rc;
+	if (endpoint_mr) {
+		/* Endpoint-MR providers (CXI) do not accept FI_REMOTE_CQ_DATA in
+		   fi_writemsg flags; remote CQ data goes through fi_writedata
+		   (requires FI_CXI_ENABLE_WRITEDATA=1). No doorbell batching. */
+		rc = fi_writedata(ep, src, size, desc, imm_data, remote_addr, dest, key,
+				  &ctx.ofi_ctx);
+	} else {
+		rc = fi_writemsg(ep, &msg, flags);
+	}
 
 	/* Drop FI_MORE for retry — must not remain pending in the queue */
 	flags &= ~FI_MORE;
