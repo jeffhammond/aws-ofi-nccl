@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #include "rdma/gin/nccl_ofi_gin.h"
 #include "rdma/gin/nccl_ofi_gin_api.h"
@@ -301,6 +302,36 @@ ncclResult_t nccl_ofi_gin_closeColl(void *collComm)
 	int ret = gin_comm->await_pending_requests();
 	if (OFI_UNLIKELY(ret != 0)) {
 		return nccl_net_ofi_retval_translate(ret);
+	}
+
+	if (endpoint_mr) {
+		/* NCCL stops the GIN proxy (progress) threads before closeColl, so a
+		   rank that owes no ACKs would tear down without ever processing the
+		   last inbound ops of a slower peer, whose ACK wait above then never
+		   completes (observed as an intermittent hang at comm destroy). Hold
+		   every rank here, still progressing, until all ranks have drained
+		   their own ACK requests; only then is it safe to remove the comm. */
+		std::atomic<bool> barrier_done{false};
+		std::thread progress_thread([&]() {
+			while (!barrier_done.load(std::memory_order_acquire)) {
+				{
+					std::lock_guard<std::mutex> lock(gin_comm->get_ep_lock());
+					if (gin_comm->get_resources().progress() != 0 ||
+					    gin_comm->drain_gdrcopy_done_queue() != 0) {
+						break;
+					}
+				}
+				std::this_thread::yield();
+			}
+		});
+		std::vector<char> arrived(gin_comm->get_nranks(), 0);
+		arrived[gin_comm->get_rank()] = 1;
+		ret = gin_comm->get_ag_comm().all_gather(arrived.data(), 1);
+		barrier_done.store(true, std::memory_order_release);
+		progress_thread.join();
+		if (OFI_UNLIKELY(ret != 0)) {
+			return nccl_net_ofi_retval_translate(ret);
+		}
 	}
 
 	/* Phase 1 — quiesce the shared gdrcopy worker for this comm. The worker
